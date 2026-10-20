@@ -577,6 +577,16 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                         "local", reason="malformed_reasoning_trace")
                     diag.record_call(succeeded=False)
                     return [], [], False
+                if not cleaned_output.strip():
+                    # A blank response is a FAILED attempt, not an empty
+                    # result. The model produced nothing, so there is
+                    # nothing to memoize: caching it would make this
+                    # content permanently unextractable even after the
+                    # model recovers. A valid JSON response whose arrays
+                    # are empty IS a real result and stays cacheable.
+                    diag.record_no_output("local")
+                    diag.record_call(succeeded=False, all_empty=True)
+                    return [], [], False
                 facts = _parse_facts(cleaned_output)
                 kg_triples = validate_kg_triples(
                     _parse_kg_triples(cleaned_output))
@@ -649,6 +659,12 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
             if local_llm._is_invalid_reasoning_output(local_clean):
                 diag.record_failure("local", reason="malformed_reasoning_trace")
                 diag.record_call(succeeded=False)
+                return [], [], False
+            if not local_clean.strip():
+                # Blank response == failed attempt, not an empty result.
+                # Not memoizable; see the host-fallback path above.
+                diag.record_no_output("local")
+                diag.record_call(succeeded=False, all_empty=True)
                 return [], [], False
             facts = _parse_facts(local_clean)
             kg_triples = validate_kg_triples(_parse_kg_triples(local_clean))
@@ -735,10 +751,22 @@ class _ExtractResultCache:
         result = self._store.get(text)
         if result is not None:
             self._store.move_to_end(text)
-        return result
+        # Hand back fresh lists. The accessors pass these straight to their
+        # callers, and a caller that clears or appends to a returned list
+        # must not be able to reach the cached value.
+        if result is None:
+            return None
+        facts, kg_triples = result
+        return list(facts), list(kg_triples)
 
     def put(self, text, result) -> None:
-        self._store[text] = result
+        # Copy at the boundary. The accessors hand the very lists they get
+        # back to their callers, and a caller that clears or appends to a
+        # returned list would otherwise mutate the CACHED list: a later
+        # extraction of the same text would return the mutated value
+        # without ever calling the model.
+        facts, kg_triples = result
+        self._store[text] = (list(facts), list(kg_triples))
         self._store.move_to_end(text)
         while len(self._store) > self._maxsize:
             self._store.popitem(last=False)

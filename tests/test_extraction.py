@@ -236,14 +236,26 @@ def test_failed_extraction_is_not_cached(monkeypatch):
     Caching the failure would make the content permanently unextractable:
     the same text would keep returning the cached empty result even after
     the LLM came back.
+
+    The model fails once and then recovers. We assert the recovery actually
+    yields the facts, and that the recovered result IS then cached -- so a
+    third call does not hit the model again. Without that second assertion
+    this test would pass even if the cache were broken in the other
+    direction (never caching anything).
     """
     from mnemosyne.core import local_llm
 
     calls = []
+    payload = json.dumps({
+        "facts": ["The user uses GAME-PC."],
+        "instructions": [], "preferences": [], "timelines": [], "kg": [],
+    })
 
     def fake_llm(prompt, max_new_tokens, stop):
         calls.append(prompt)
-        raise RuntimeError("model crashed")
+        if len(calls) == 1:
+            raise RuntimeError("model crashed")
+        return payload
 
     monkeypatch.setattr(local_llm, "llm_available", lambda: True)
     monkeypatch.setattr(
@@ -255,9 +267,135 @@ def test_failed_extraction_is_not_cached(monkeypatch):
     monkeypatch.setattr(local_llm, "_clean_output", lambda s: s)
 
     text = "failed-extraction-not-cached-unique-content"
+    # First call fails -> empty, and NOT memoized.
     assert extract_facts_safe(text) == []
-    assert extract_facts_safe(text) == []
+    assert len(calls) == 1
+    # Second call retries (the failure was not cached) and succeeds.
+    assert extract_facts_safe(text) == ["The user uses GAME-PC."]
     assert len(calls) == 2
+    # Third call is served from the cache of the SUCCESSFUL extraction.
+    assert extract_facts_safe(text) == ["The user uses GAME-PC."]
+    assert len(calls) == 2
+
+
+def test_blank_llm_response_is_not_cached(monkeypatch):
+    """A blank model response is a failed attempt, not an empty result.
+
+    If "" were memoized as a successful extraction, the content could never
+    be extracted again for the life of the process, even after the model
+    recovered. A valid JSON response whose arrays are empty IS a real
+    result and stays cacheable.
+    """
+    from mnemosyne.core import local_llm
+
+    calls = []
+    payload = json.dumps({
+        "facts": ["The user uses GAME-PC."],
+        "instructions": [], "preferences": [], "timelines": [], "kg": [],
+    })
+
+    def fake_llm(prompt, max_new_tokens, stop):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return ""          # blank -> failed attempt
+        return payload
+
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    monkeypatch.setattr(
+        local_llm, "_try_host_llm",
+        lambda prompt, max_tokens, temperature: (False, ""),
+    )
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: fake_llm)
+    monkeypatch.setattr(local_llm, "_clean_output", lambda s: s)
+
+    text = "blank-response-not-cached-unique-content"
+    assert extract_facts_safe(text) == []
+    assert len(calls) == 1
+    # The blank result was not memoized -> the content is still retryable.
+    assert extract_facts_safe(text) == ["The user uses GAME-PC."]
+    assert len(calls) == 2
+
+
+def test_empty_json_arrays_are_still_cached(monkeypatch):
+    """A valid JSON response with empty arrays IS a real, cacheable result.
+
+    This is the counterpart to the blank-response test: "no facts here" is
+    a legitimate answer, and re-running the model for it every time would
+    be a needless cost.
+    """
+    from mnemosyne.core import local_llm
+
+    calls = []
+    payload = json.dumps({
+        "facts": [], "instructions": [], "preferences": [],
+        "timelines": [], "kg": [],
+    })
+
+    def fake_llm(prompt, max_new_tokens, stop):
+        calls.append(prompt)
+        return payload
+
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    monkeypatch.setattr(
+        local_llm, "_try_host_llm",
+        lambda prompt, max_tokens, temperature: (False, ""),
+    )
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: fake_llm)
+    monkeypatch.setattr(local_llm, "_clean_output", lambda s: s)
+
+    text = "empty-json-is-cacheable-unique-content"
+    assert extract_facts_safe(text) == []
+    assert extract_facts_safe(text) == []
+    assert len(calls) == 1
+
+
+def test_caller_cannot_mutate_cached_results(monkeypatch):
+    """A caller mutating a returned list must not corrupt the cache.
+
+    The accessors hand their lists straight to the caller. If the cached
+    list were the same object, a caller that cleared or appended to it
+    would silently change what a later extraction of the same text
+    returns -- without the model ever being called again.
+    """
+    from mnemosyne.core import local_llm
+
+    calls = []
+    payload = json.dumps({
+        "facts": ["The user uses GAME-PC."],
+        "instructions": [], "preferences": [], "timelines": [],
+        "kg": [{"subject": "Calypso", "predicate": "uses", "object": "GAME-PC"}],
+    })
+
+    def fake_llm(prompt, max_new_tokens, stop):
+        calls.append(prompt)
+        return payload
+
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    monkeypatch.setattr(
+        local_llm, "_try_host_llm",
+        lambda prompt, max_tokens, temperature: (False, ""),
+    )
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: fake_llm)
+    monkeypatch.setattr(local_llm, "_clean_output", lambda s: s)
+
+    text = "cache-mutation-isolation-unique-content"
+    facts = extract_facts_safe(text)
+    triples = extract_triples_for_beam(text)
+    assert facts == ["The user uses GAME-PC."]
+    assert triples == [("Calypso", "uses", "GAME-PC")]
+    assert len(calls) == 1
+
+    # Mutate what the caller received.
+    facts.clear()
+    triples.append(("MUTATED", "x", "y"))
+
+    # A later access must return the pristine cached values.
+    assert extract_facts_safe(text) == ["The user uses GAME-PC."]
+    assert extract_triples_for_beam(text) == [("Calypso", "uses", "GAME-PC")]
+    assert len(calls) == 1
 
 
 def test_parse_facts_json_drops_mixed_case_spo_repr():
