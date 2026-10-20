@@ -94,6 +94,38 @@ def _build_extraction_prompt(text: str, detected_lang: str = 'en') -> str:
 _SPO_KEYS = ("subject", "predicate", "object")
 
 
+def _spo_dict(item):
+    """Return the mapping an SPO-shaped item carries, or None.
+
+    A dict is returned as-is. A STRING is read as the repr of a dict -- which
+    is what a stray SPO object looks like once something upstream has run
+    ``str()`` over it -- and recovered with ``literal_eval`` rather than
+    whitespace-split, so the mapping it encodes is what comes back.
+
+    Key names are matched case-insensitively in both branches, so a repr using
+    'Subject'/'Predicate'/'Object' is recognised exactly like the dict it
+    stands for.
+    """
+    if isinstance(item, dict):
+        return item
+    if isinstance(item, str):
+        text = item.strip()
+        if not text.startswith("{"):
+            return None
+        # Cheap reject before literal_eval, and case-insensitive: the key
+        # names may be capitalised, and a repr that mentions none of them
+        # cannot be an SPO object.
+        lowered = text.lower()
+        if not all(key in lowered for key in _SPO_KEYS):
+            return None
+        try:
+            recovered = ast.literal_eval(text)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+        return recovered if isinstance(recovered, dict) else None
+    return None
+
+
 def _spo_fields(item):
     """Return ``(subject, predicate, object)`` for an UNAMBIGUOUS SPO item.
 
@@ -109,34 +141,31 @@ def _spo_fields(item):
     guessing wrong would both invent a triple and delete facts. A plain sentence
     never qualifies, because a fabricated SPO split is worse than no triple.
     """
-    if isinstance(item, dict):
-        fields = {str(key).lower(): value for key, value in item.items()}
-        subject = fields.get("subject")
-        predicate = fields.get("predicate")
-        obj = fields.get("object")
-        if subject and predicate and obj:
-            return (str(subject), str(predicate), str(obj))
+    data = _spo_dict(item)
+    if data is None:
         return None
-    if isinstance(item, str):
-        text = item.strip()
-        if not (
-            text.startswith("{")
-            and "subject" in text
-            and "predicate" in text
-            and "object" in text
-        ):
-            return None
-        try:
-            recovered = ast.literal_eval(text)
-        except (ValueError, SyntaxError, MemoryError, RecursionError):
-            return None
-        return _spo_fields(recovered) if isinstance(recovered, dict) else None
+    fields = {str(key).lower(): value for key, value in data.items()}
+    subject = fields.get("subject")
+    predicate = fields.get("predicate")
+    obj = fields.get("object")
+    if subject and predicate and obj:
+        return (str(subject), str(predicate), str(obj))
     return None
 
 
-def _is_spo_item(item) -> bool:
-    """True when :func:`_spo_fields` can read a triple out of this item."""
-    return _spo_fields(item) is not None
+def _has_spo_keys(item) -> bool:
+    """True when the item carries all three SPO keys, whatever their values.
+
+    Key presence is independent of value validity. A dict with an empty or
+    null field is still a misfiled triple: it must not be stored as an
+    ordinary fact string, even though :func:`_spo_fields` refuses to read a
+    triple out of it and it therefore never reaches the KG.
+    """
+    data = _spo_dict(item)
+    if data is None:
+        return False
+    keys = {str(key).lower() for key in data}
+    return all(key in keys for key in _SPO_KEYS)
 
 
 def _parse_facts(raw_output: str) -> List[str]:
@@ -185,7 +214,11 @@ def _parse_facts(raw_output: str) -> List[str]:
                             # rows in the facts table while the real triple was
                             # lost: drop it, so _parse_kg_triples can recover it
                             # into the KG instead of storing a repr as knowledge.
-                            if _is_spo_item(item):
+                            #
+                            # Key presence decides here, not value validity: a
+                            # triple-shaped dict with an empty or null field is
+                            # misfiled too, and must not become a fact string.
+                            if _has_spo_keys(item):
                                 continue
                             text = str(item)
                             key = text.strip().casefold()
@@ -428,7 +461,7 @@ def _call_local_extraction_llm(llm, prompt: str) -> str:
     )
 
 
-def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
     """
     Core LLM tier chain shared by :func:`extract_facts` and
     :func:`extract_facts_with_triples`.
@@ -439,7 +472,12 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
         text: Raw memory content to extract facts from
 
     Returns:
-        List of extracted fact strings (0-5 items). Empty list if LLM unavailable.
+        (facts, kg_triples, ok) -- facts holds the extracted fact strings
+        (0-5 items), kg_triples the validated triples, and ok is True only
+        when the tier chain finished without an error. A failed extraction
+        (LLM unavailable, raising, or a malformed reasoning trace) reports
+        ok=False so the caller can retry that content later instead of
+        memoizing the failure.
 
     Notes:
         - The host backend (Hermes auxiliary client) is consulted first when
@@ -464,14 +502,14 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
     if not text or not text.strip():
         # Caller passed nothing — this isn't a failure, just no work.
         # Don't record_call: this isn't really an extraction attempt.
-        return [], []
+        return [], [], False
 
     if not local_llm.llm_available():
         diag.record_failure(
             "local", reason="llm_unavailable_at_call_site",
         )
         diag.record_call(succeeded=False, all_empty=False)
-        return [], []
+        return [], [], False
 
     prompt = _build_extraction_prompt(text)
 
@@ -499,21 +537,21 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
             "extract_facts: host LLM adapter raised: %s",
             diagnostics_safe_for_log(e),
         )
-        return [], []
+        return [], [], False
 
     if attempted:
         diag.record_attempt("host")
         if local_llm._is_invalid_reasoning_output(host_text):
             diag.record_failure("host", reason="malformed_reasoning_trace")
             diag.record_call(succeeded=False)
-            return [], []
+            return [], [], False
         if host_text:
             facts = _parse_facts(host_text)
             kg_triples = validate_kg_triples(_parse_kg_triples(host_text))
             if facts or kg_triples:
                 diag.record_success("host", fact_count=len(facts))
                 diag.record_call(succeeded=True)
-                return facts, kg_triples
+                return facts, kg_triples, True
             diag.record_no_output("host")
         else:
             diag.record_no_output("host")
@@ -529,7 +567,7 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                 diagnostics_safe_for_log(e),
             )
             diag.record_call(succeeded=False)
-            return [], []
+            return [], [], False
         if llm is not None:
             try:
                 raw_output = _call_local_extraction_llm(llm, prompt)
@@ -538,7 +576,7 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                     diag.record_failure(
                         "local", reason="malformed_reasoning_trace")
                     diag.record_call(succeeded=False)
-                    return [], []
+                    return [], [], False
                 facts = _parse_facts(cleaned_output)
                 kg_triples = validate_kg_triples(
                     _parse_kg_triples(cleaned_output))
@@ -548,7 +586,7 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                 else:
                     diag.record_no_output("local")
                     diag.record_call(succeeded=False, all_empty=True)
-                return facts, kg_triples
+                return facts, kg_triples, True
             except Exception as e:
                 diag.record_failure("local", exc=e, reason="ctransformers_raised")
                 logger.warning(
@@ -556,10 +594,10 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                     diagnostics_safe_for_log(e),
                 )
                 diag.record_call(succeeded=False)
-                return [], []
+                return [], [], False
         diag.record_failure("local", reason="model_not_loaded")
         diag.record_call(succeeded=False, all_empty=True)
-        return [], []
+        return [], [], False
 
     # 1. Remote LLM. Pass temperature=0.0 so the C2 determinism contract
     # holds even on the standalone remote path (where extract_facts shares
@@ -581,13 +619,13 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                 diag.record_failure(
                     "remote", reason="malformed_reasoning_trace")
                 diag.record_call(succeeded=False)
-                return [], []
+                return [], [], False
             facts = _parse_facts(remote_clean)
             kg_triples = validate_kg_triples(_parse_kg_triples(remote_clean))
             if facts or kg_triples:
                 diag.record_success("remote", fact_count=len(facts))
                 diag.record_call(succeeded=True)
-                return facts, kg_triples
+                return facts, kg_triples, True
             diag.record_no_output("remote")
         else:
             diag.record_no_output("remote")
@@ -603,7 +641,7 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
             diagnostics_safe_for_log(e),
         )
         diag.record_call(succeeded=False)
-        return [], []
+        return [], [], False
     if llm is not None:
         try:
             raw_output = _call_local_extraction_llm(llm, prompt)
@@ -611,17 +649,17 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
             if local_llm._is_invalid_reasoning_output(local_clean):
                 diag.record_failure("local", reason="malformed_reasoning_trace")
                 diag.record_call(succeeded=False)
-                return [], []
+                return [], [], False
             facts = _parse_facts(local_clean)
             kg_triples = validate_kg_triples(_parse_kg_triples(local_clean))
             if facts or kg_triples:
                 diag.record_success("local", fact_count=len(facts))
                 diag.record_call(succeeded=True)
-                return facts, kg_triples
+                return facts, kg_triples, True
             else:
                 diag.record_no_output("local")
                 diag.record_call(succeeded=False, all_empty=True)
-            return facts, kg_triples
+            return facts, kg_triples, True
         except Exception as e:
             diag.record_failure("local", exc=e, reason="ctransformers_raised")
             logger.warning(
@@ -629,11 +667,11 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
                 diagnostics_safe_for_log(e),
             )
             diag.record_call(succeeded=False)
-            return [], []
+            return [], [], False
 
     diag.record_failure("local", reason="model_not_loaded")
     diag.record_call(succeeded=False, all_empty=True)
-    return [], []
+    return [], [], False
 
 
 def extract_facts(text: str) -> List[str]:
@@ -666,9 +704,15 @@ def extract_facts_with_triples(
     cached = _EXTRACT_CACHE.get(text)
     if cached is not None:
         return cached
-    result = _extract_facts_impl(text)
-    _EXTRACT_CACHE.put(text, result)
-    return result
+    facts, kg_triples, ok = _extract_facts_impl(text)
+    if ok:
+        # Only a completed extraction is memoized. Caching a FAILURE would
+        # make the content permanently unextractable: the same text would keep
+        # returning the cached empty result even after the LLM came back, so a
+        # transient outage would silently drop those facts for the life of
+        # the process.
+        _EXTRACT_CACHE.put(text, (facts, kg_triples))
+    return facts, kg_triples
 
 
 class _ExtractResultCache:

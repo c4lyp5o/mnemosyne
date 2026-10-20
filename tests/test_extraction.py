@@ -2,6 +2,7 @@
 Tests for Mnemosyne Structured Fact Extraction (Phase 2)
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mnemosyne.core.extraction import (
     extract_facts,
     extract_facts_safe,
+    extract_triples_for_beam,
     _build_extraction_prompt,
     _call_local_extraction_llm,
     _parse_facts,
@@ -191,20 +193,95 @@ def test_parse_facts_json_drops_misfiled_spo_objects():
 
 
 def test_extract_facts_and_triples_share_one_llm_result(monkeypatch):
-    """The two remember() accessors must reuse one extraction result."""
-    from mnemosyne.core import extraction as extraction_module
+    """The two remember() accessors must reuse one extraction result.
+
+    The mocked LLM returns a single raw response holding both a prose fact
+    and an SPO dict filed under the flat "facts" category -- the shape the
+    parser has to split: the prose line is a fact, the dict is a misfiled
+    triple that _parse_kg_triples recovers into the KG.
+    """
+    from mnemosyne.core import local_llm
+
+    raw = json.dumps({
+        "facts": [
+            "The user uses GAME-PC.",
+            {"subject": "Calypso", "predicate": "uses", "object": "GAME-PC"},
+        ],
+        "kg": [],
+    })
+    calls = []
+
+    def fake_llm(prompt, max_new_tokens, stop):
+        calls.append(prompt)
+        return raw
+
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    monkeypatch.setattr(
+        local_llm, "_try_host_llm",
+        lambda prompt, max_tokens, temperature: (False, ""),
+    )
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: fake_llm)
+    monkeypatch.setattr(local_llm, "_clean_output", lambda s: s)
+
+    text = "cache-sharing-regression-unique-content"
+    assert extract_facts_safe(text) == ["The user uses GAME-PC."]
+    assert extract_triples_for_beam(text) == [("Calypso", "uses", "GAME-PC")]
+    assert len(calls) == 1
+
+
+def test_failed_extraction_is_not_cached(monkeypatch):
+    """A failed extraction must not poison the memo for that content.
+
+    Caching the failure would make the content permanently unextractable:
+    the same text would keep returning the cached empty result even after
+    the LLM came back.
+    """
+    from mnemosyne.core import local_llm
 
     calls = []
-    expected = (["The user uses GAME-PC."], [("Calypso", "uses", "GAME-PC")])
+
+    def fake_llm(prompt, max_new_tokens, stop):
+        calls.append(prompt)
+        raise RuntimeError("model crashed")
+
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
     monkeypatch.setattr(
-        extraction_module,
-        "_extract_facts_impl",
-        lambda text: (calls.append(text) or expected),
+        local_llm, "_try_host_llm",
+        lambda prompt, max_tokens, temperature: (False, ""),
     )
-    text = "cache-sharing-regression-unique-content"
-    assert extract_facts_safe(text) == expected[0]
-    assert extraction_module.extract_triples_for_beam(text) == expected[1]
-    assert calls == [text]
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: fake_llm)
+    monkeypatch.setattr(local_llm, "_clean_output", lambda s: s)
+
+    text = "failed-extraction-not-cached-unique-content"
+    assert extract_facts_safe(text) == []
+    assert extract_facts_safe(text) == []
+    assert len(calls) == 2
+
+
+def test_parse_facts_json_drops_mixed_case_spo_repr():
+    """A repr with mixed-case SPO keys is still a triple, not a fact string."""
+    raw = json.dumps({
+        "facts": [
+            "{'Subject': 'Calypso', 'Predicate': 'uses', 'Object': 'GAME-PC'}",
+            "A plain fact sentence about GAME-PC.",
+        ],
+        "instructions": [], "preferences": [], "timelines": [], "kg": [],
+    })
+    assert _parse_facts(raw) == ["A plain fact sentence about GAME-PC."]
+
+
+def test_parse_facts_json_drops_spo_dict_with_null_field():
+    """A triple-shaped dict with an empty field is still misfiled, not a fact."""
+    raw = json.dumps({
+        "facts": [
+            {"subject": "Calypso", "predicate": "uses", "object": None},
+            "A plain fact sentence about GAME-PC.",
+        ],
+        "instructions": [], "preferences": [], "timelines": [], "kg": [],
+    })
+    assert _parse_facts(raw) == ["A plain fact sentence about GAME-PC."]
 
 
 def test_parse_facts_json_without_supported_categories_falls_back():
